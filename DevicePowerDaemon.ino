@@ -58,6 +58,7 @@ void setup() {
     analogWrite(powerLevelIndicator[i], 0);
   }
 
+  //start printing to serial and display some status info
   Serial.begin(115200);
   Serial.println(F("Device Control Device Power Debug Interface"));
   Serial.println(F("-------------------------------------------"));
@@ -86,20 +87,22 @@ void loop() {
       Serial.println(F("Waiting for BLE connection"));
       hasPrintedConnectionError = true;
     }
-    delay(500);
+    delay(250);
   }
   hasPrintedConnectionError = false;
 
   //light up the connection status LED
   if(ble.isVersionAtLeast(MINIMUM_FIRMWARE_VERSION)) {
     if(!hasPrintedConnectionSuccess) {
-      Serial.println(F("Connected to device"));
+      Serial.print(F("Connected to device\n"));
       int signalStrength = getRSSI();
-      Serial.print(F("Signal strength is "));
-      Serial.print(signalStrength);
-      Serial.println(F(" dBm"));
+      if(signalStrength != -1) {
+        Serial.print(F("Signal strength is "));
+        Serial.print(signalStrength);
+        Serial.println(F(" dBm"));
+      }
       hasPrintedConnectionSuccess = true;
-      //check power level every 2 minutes
+      /*//check power level every 2 minutes
       if(adjust_tx_power_timer == 0) {
         Serial.println(F("Adjusting TX Power"));
         adjustTXPower();
@@ -112,6 +115,7 @@ void loop() {
       }
       adjust_tx_power_timer += 1;
       adjust_tx_power_timer %= 1200;
+      */
     }
     ble.sendCommandCheckOK("AT+HWModeLED=" MODE_LED_BEHAVIOUR);
   }
@@ -119,11 +123,16 @@ void loop() {
   //check for power level set request
   ble.println("AT+BLEUARTRX");
   ble.readline();
-  if(strcmp(ble.buffer, "OK") != 0) {
-    int power_level_request = atoi(ble.buffer);
-    if(strcmp(ble.buffer, "0") != 0 && power_level_request == 0) {
+  if(strncmp(ble.buffer, "SET", 3) == 0) {
+    int size_of_buffer = strlen(ble.buffer);
+    char num_part[size_of_buffer - 4];
+    for(int i = 4; i < size_of_buffer; i++) {
+      num_part[i - 4] = ble.buffer[i];
+    }
+    int power_level_request = atoi(num_part);
+    if(strcmp(num_part, "0") != 0 && power_level_request == 0) {
       Serial.print(F("ERROR: cannot set power level to "));
-      Serial.print(ble.buffer);
+      Serial.print(num_part);
       Serial.println();
     } else {
       bool success = set_device_power_level(power_level_request);
@@ -131,22 +140,32 @@ void loop() {
         Serial.print("Changed power level to ");
         Serial.print(power_level_request);
         Serial.println();
+        ble.print("AT+BLEUARTTX=");
+        ble.print("OK ");
+        ble.println(current_power_level);
+      }
+      else {
+        ble.print("AT+BLEUARTTX=");
+        ble.println("FAIL");
       }
     }
+  } else if(strncmp(ble.buffer, "RQT", 3) == 0) {
+      Serial.println(F("Got power request"));
+      ble.print("AT+BLEUARTTX=");
+      ble.println(current_power_level);
+  } else if(strcmp(BLE_CMD_OK, ble.buffer) != 0) {
+      Serial.print(F("Unknown command "));
+      Serial.println(ble.buffer);
   }
-
-  //send power usage
-  if(level_send_timer == 0) {
-    ble.print("AT+BLEUARTTX=");
-    ble.println(current_power_level);
-  }
-
-  level_send_timer += 1;
-  level_send_timer %= 20;
+  
   delay(100);
 
 }
 
+//checks if power level is valid (in range). if it is valid then
+//the global power level is adjusted and the lights on the board
+//are lit accordingly
+//returns true if power set successful, false otherwise
 bool set_device_power_level(int p) {
   if(p > MAX_POWER_LEVEL || p < MIN_POWER_LEVEL) { 
     Serial.print(F("Refusing to set power level "));
@@ -175,11 +194,23 @@ bool set_device_power_level(int p) {
   return true;
 }
 
+//copy name of connected device into parameter
+//this does not work and is not important
+void getConnectedDeviceName(char name[]){
+  if(ble.isConnected()){
+    ble.print("AT+BLEGETPEERADDR");
+    delay(BLE_CMD_DELAY);
+    ble.readline();
+    strncpy(name, ble.buffer, 18);
+  }
+}
+
+//returns the received signal strength indicator of the device
 int getRSSI() {
   if(ble.isConnected()){
     ble.println("AT+BLEGETRSSI");
     //delay a little so the BLE has time to respond
-    delay(50);
+    delay(BLE_CMD_DELAY);
     ble.readline();
     int level = atoi(ble.buffer);
     return level;
@@ -187,6 +218,7 @@ int getRSSI() {
   return -1;
 }
 
+//return the power that we are transmitting at in dBm
 int getTXPower() {
   ble.println("AT+BLEPOWERLEVEL");
   //delay a little so the BLE has time to respond
@@ -196,6 +228,7 @@ int getTXPower() {
   return level;
 }
 
+//checks for valid TX powers. this is device specific
 bool isValidTXPower(int p) {
   switch(p) {
     case -40:
@@ -213,6 +246,7 @@ bool isValidTXPower(int p) {
   }
 }
 
+//modify the transmit power of the device, return true if successful
 bool setTXPower(int p) {
   if(isValidTXPower(p)) {
     ble.print("AT+BLEPOWERLEVEL=");
@@ -226,6 +260,7 @@ bool setTXPower(int p) {
   return false;
 }
 
+//automatically scale TX power based on RSSI
 void adjustTXPower(){
   int currentRSSI = getRSSI();
   int txPower = getTXPower();
@@ -242,12 +277,15 @@ void adjustTXPower(){
   }
 }
 
+
+///blink the builtin LED to indicate catastrophic failure
 void blink_error(int err_code) {
   if(err_code == ERR_BLE_INIT_FAIL) {
     blink_three_burst();
   }
 }
 
+//helper function for blink_error()
 void blink_three_burst() {
   digitalWrite(13, LOW);
   Serial.println(F("ERROR -- EXECUTION HALT"));
